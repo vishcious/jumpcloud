@@ -1,31 +1,49 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"regexp"
 	"strconv"
+	"sync"
 	"time"
-
-	"golang.org/x/crypto/bcrypt"
 )
 
 func main() {
+	httpServerExitDone := &sync.WaitGroup{}
+	httpServerExitDone.Add(1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	r := &Router{
-		getNextId: getIncrementer(0),
-		container: HashContainer{
-			hashes: make(map[uint64]Result),
-			stats:  Stats{Total: 0, Average: 0},
-		},
+		getNextId:     getIncrementer(0),
+		container:     *createHashProcessor(),
+		shutdown:      httpServerExitDone,
+		stopListening: cancel,
 	}
 
-	http.ListenAndServe(":8080", r)
+	server := &http.Server{Addr: ":8080", Handler: r}
+	fmt.Println("Starting server")
+	go server.ListenAndServe()
+	go r.container.doWork()
+	// Wait for cancel to be called on http server context
+	<-ctx.Done()
+	// Stop listening to http requests
+	shutdownCtx, shutdownCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer shutdownCancel()
+	server.Shutdown(shutdownCtx)
+	// Wait for workers to be shutdown
+	httpServerExitDone.Wait()
+	fmt.Println("Shutting down server")
 }
 
 type Router struct {
-	getNextId func() uint64
-	container HashContainer
+	getNextId     func() uint64
+	container     HashContainer
+	shutdown      *sync.WaitGroup
+	stopListening context.CancelFunc
 }
 
 func (sr *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -35,6 +53,16 @@ func (sr *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.Method == "GET" && r.URL.Path == "/stats" {
 		getStats(w, r, &sr.container)
+		return
+	}
+	if r.Method == "POST" && r.URL.Path == "/shutdown" {
+		// Stop listening on web server
+		sr.stopListening()
+		// Stop the worker from accepting any more jobs
+		// The web server should be stopped before stopping workers to ensure jobs are not added to a closed channel
+		sr.container.shutdown()
+		w.WriteHeader(http.StatusOK)
+		sr.shutdown.Done()
 		return
 	}
 
@@ -55,21 +83,7 @@ func (sr *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func generateNewHash(w http.ResponseWriter, r *http.Request, id uint64, container *HashContainer) {
-	start := time.Now()
-	go func() {
-		// This just parks the goroutine and does not consume any CPU cycles
-		// https://stackoverflow.com/questions/32147421/behavior-of-sleep-and-select-in-go
-		// https://xwu64.github.io/2019/02/27/Understanding-Golang-sleep-function/
-		time.Sleep(5 * time.Second)
-		hash, err := hashPassword(r.FormValue("password"))
-		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			fmt.Fprintf(w, "%s", err.Error())
-			return
-		}
-		container.setHashById(id, hash)
-		container.trackTime(start)
-	}()
+	container.jobs <- HashRequest{id: id, password: r.FormValue("password")}
 	w.WriteHeader(http.StatusAccepted)
 	fmt.Fprintf(w, "%d", id)
 }
@@ -92,9 +106,4 @@ func getStats(w http.ResponseWriter, r *http.Request, container *HashContainer) 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(container.stats)
 	w.WriteHeader(http.StatusOK)
-}
-
-func hashPassword(password string) (string, error) {
-	bytes, err := bcrypt.GenerateFromPassword([]byte(password), 14)
-	return string(bytes), err
 }
