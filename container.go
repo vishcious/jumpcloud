@@ -50,14 +50,13 @@ func (c *HashContainer) doWork() {
 		c.worker.Add(1)
 		go func(req HashRequest) {
 			defer c.worker.Done()
-			start := time.Now()
+			defer c.trackTime(time.Now())
 			// This just parks the goroutine and does not consume any CPU cycles
 			// https://stackoverflow.com/questions/32147421/behavior-of-sleep-and-select-in-go
 			// https://xwu64.github.io/2019/02/27/Understanding-Golang-sleep-function/
 			time.Sleep(5 * time.Second)
 			hash, err := hashPassword(req.password)
 			c.setHashById(req.id, &HashResult{hash: hash, err: err})
-			c.trackTime(start)
 		}(input)
 	}
 }
