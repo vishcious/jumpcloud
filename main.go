@@ -7,27 +7,23 @@ import (
 	"net/http"
 	"regexp"
 	"strconv"
-	"sync"
 	"time"
 )
 
 func main() {
-	httpServerExitDone := &sync.WaitGroup{}
-	httpServerExitDone.Add(1)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	r := &Router{
-		getNextId:     getIncrementer(0),
-		container:     *createHashProcessor(),
-		shutdown:      httpServerExitDone,
+		getNextId:     GetIncrementer(0),
+		container:     *CreateHashProcessor(),
 		stopListening: cancel,
 	}
 
 	server := &http.Server{Addr: ":8080", Handler: r}
 	fmt.Println("Starting server")
 	go server.ListenAndServe()
-	go r.container.doWork()
+	go r.container.StartAcceptingWork()
 	// Wait for cancel to be called on http server context
 	<-ctx.Done()
 	// Stop listening to http requests
@@ -35,18 +31,19 @@ func main() {
 	defer shutdownCancel()
 	server.Shutdown(shutdownCtx)
 	// Wait for workers to be shutdown
-	httpServerExitDone.Wait()
+	// worker currently processing will be waited on to finish
+	r.container.worker.Wait()
 	fmt.Println("Shutting down server")
 }
 
 type Router struct {
 	getNextId     func() uint64
 	container     HashContainer
-	shutdown      *sync.WaitGroup
 	stopListening context.CancelFunc
 }
 
 func (sr *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Here goes the simplest router I came up with without using external packages
 	if r.Method == "POST" && r.URL.Path == "/hash" {
 		generateNewHash(w, r, sr.getNextId(), &sr.container)
 		return
@@ -60,9 +57,8 @@ func (sr *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		sr.stopListening()
 		// Stop the worker from accepting any more jobs
 		// The web server should be stopped before stopping workers to ensure jobs are not added to a closed channel
-		sr.container.shutdown()
+		sr.container.StopAcceptingWork()
 		w.WriteHeader(http.StatusOK)
-		sr.shutdown.Done()
 		return
 	}
 
@@ -83,13 +79,13 @@ func (sr *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func generateNewHash(w http.ResponseWriter, r *http.Request, id uint64, container *HashContainer) {
-	container.jobs <- HashRequest{id: id, password: r.FormValue("password")}
+	container.DoWork(&HashRequest{id: id, password: r.FormValue("password")})
 	w.WriteHeader(http.StatusAccepted)
 	fmt.Fprintf(w, "%d", id)
 }
 
 func getHash(w http.ResponseWriter, r *http.Request, id uint64, container *HashContainer) {
-	hash, err := container.getHashById(id)
+	hash, err := container.GetHashById(id)
 	if err != nil {
 		w.WriteHeader(http.StatusNotFound)
 		return
@@ -104,6 +100,6 @@ func getHash(w http.ResponseWriter, r *http.Request, id uint64, container *HashC
 
 func getStats(w http.ResponseWriter, r *http.Request, container *HashContainer) {
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(container.stats)
 	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(container.stats)
 }

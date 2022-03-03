@@ -31,48 +31,55 @@ type HashContainer struct {
 	worker *sync.WaitGroup
 }
 
-func createHashProcessor() *HashContainer {
+func CreateHashProcessor() *HashContainer {
 	c := &HashContainer{
 		hashes: make(map[uint64]*HashResult),
 		stats:  Stats{Total: 0, Average: 0},
-		jobs:   make(chan HashRequest),
 		worker: &sync.WaitGroup{},
 	}
 	return c
 }
 
-func (c *HashContainer) shutdown() {
+func (c *HashContainer) StopAcceptingWork() {
 	close(c.jobs)
 }
 
-func (c *HashContainer) doWork() {
+func (c *HashContainer) StartAcceptingWork() {
+	c.jobs = make(chan HashRequest)
 	for input := range c.jobs {
 		c.worker.Add(1)
 		go func(req HashRequest) {
 			defer c.worker.Done()
-			defer c.trackTime(time.Now())
+			defer c.TrackTime(time.Now())
 			// This just parks the goroutine and does not consume any CPU cycles
 			// https://stackoverflow.com/questions/32147421/behavior-of-sleep-and-select-in-go
 			// https://xwu64.github.io/2019/02/27/Understanding-Golang-sleep-function/
 			time.Sleep(5 * time.Second)
-			hash, err := hashPassword(req.password)
-			c.setHashById(req.id, &HashResult{hash: hash, err: err})
+			hash, err := HashPassword(req.password)
+			c.SetHashById(req.id, &HashResult{hash: hash, err: err})
 		}(input)
 	}
 }
 
-func hashPassword(password string) (string, error) {
+func HashPassword(password string) (string, error) {
 	bytes, err := bcrypt.GenerateFromPassword([]byte(password), 14)
 	return string(bytes), err
 }
 
-func (c *HashContainer) setHashById(id uint64, hash *HashResult) {
+func (c *HashContainer) DoWork(req *HashRequest) {
+	if c.jobs == nil {
+		panic("StartAcceptingWork needs to be called before sending work")
+	}
+	c.jobs <- *req
+}
+
+func (c *HashContainer) SetHashById(id uint64, hash *HashResult) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.hashes[id] = hash
 }
 
-func (c *HashContainer) getHashById(id uint64) (*HashResult, error) {
+func (c *HashContainer) GetHashById(id uint64) (*HashResult, error) {
 	value, exists := c.hashes[id]
 	if exists {
 		return value, nil
@@ -80,7 +87,7 @@ func (c *HashContainer) getHashById(id uint64) (*HashResult, error) {
 	return nil, fmt.Errorf("ID '%d' not found", id)
 }
 
-func (c *HashContainer) trackTime(start time.Time) {
+func (c *HashContainer) TrackTime(start time.Time) {
 	elapsed := time.Since(start)
 	c.mu.Lock()
 	defer c.mu.Unlock()
